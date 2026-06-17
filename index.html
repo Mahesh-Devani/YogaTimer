@@ -524,6 +524,16 @@ label.lbl {
       <div class="next-up" id="nextUp"></div>
       <div class="seq-dots" id="seqDots"></div>
 
+      <!-- Wake lock / keepalive status -->
+      <div style="display:flex;justify-content:center;gap:10px;margin-bottom:10px;">
+        <div id="wakeLockBadge" style="font-size:.58rem;letter-spacing:.08em;padding:3px 10px;border-radius:20px;background:rgba(255,255,255,.05);color:var(--text-dim);border:1px solid rgba(255,255,255,.08);">
+          ⚫ SCREEN LOCK OFF
+        </div>
+        <div id="keepaliveBadge" style="font-size:.58rem;letter-spacing:.08em;padding:3px 10px;border-radius:20px;background:rgba(255,255,255,.05);color:var(--text-dim);border:1px solid rgba(255,255,255,.08);">
+          ⚫ KEEPALIVE OFF
+        </div>
+      </div>
+
       <div class="runner-controls">
         <button class="btn btn-secondary" onclick="sessionPrev()">◀ PREV</button>
         <button class="btn btn-primary" id="rPlayBtn" onclick="toggleSession()">PAUSE</button>
@@ -884,6 +894,7 @@ function initDrag(li) {
 let sess = {
   plan: null, idx: 0,
   timer: null, elapsed: 0, running: false,
+  sessionPhaseStartWall: 0,  // wall-clock anchor for drift-free timing
   // AUM
   aumCtx: null, aumAnalyser: null, aumStream: null, aumFrame: null,
   aumCount: 0, aumSounding: false, aumSoundStart: 0,
@@ -929,6 +940,7 @@ function updateDots() {
 function loadSessionExercise(idx) {
   stopCurrentExerciseSideEffects();
   sess.idx = idx; sess.elapsed = 0;
+  sess.sessionPhaseStartWall = Date.now(); // reset wall clock for new phase
   const ex = sess.plan.exercises[idx];
   document.getElementById('rPlanName').textContent = sess.plan.name.toUpperCase();
   document.getElementById('rExName').textContent = ex.name;
@@ -962,25 +974,113 @@ function toggleSession() {
   else { resumeSession(); }
 }
 
+// ── Wake Lock ──
+let wakeLock = null;
+function updateBadges() {
+  const wlb = document.getElementById('wakeLockBadge');
+  const kab = document.getElementById('keepaliveBadge');
+  if (wlb) {
+    const on = wakeLock !== null;
+    wlb.textContent = on ? '🟢 SCREEN ON' : '⚫ SCREEN LOCK OFF';
+    wlb.style.color = on ? '#8BC34A' : 'var(--text-dim)';
+    wlb.style.borderColor = on ? 'rgba(92,122,62,.4)' : 'rgba(255,255,255,.08)';
+    wlb.style.background = on ? 'rgba(92,122,62,.12)' : 'rgba(255,255,255,.05)';
+  }
+  if (kab) {
+    const on = keepaliveNode !== null;
+    kab.textContent = on ? '🟢 BACKGROUND RUN' : '⚫ KEEPALIVE OFF';
+    kab.style.color = on ? '#8BC34A' : 'var(--text-dim)';
+    kab.style.borderColor = on ? 'rgba(92,122,62,.4)' : 'rgba(255,255,255,.08)';
+    kab.style.background = on ? 'rgba(92,122,62,.12)' : 'rgba(255,255,255,.05)';
+  }
+}
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; updateBadges(); });
+    updateBadges();
+  } catch(e) { /* not available on this device/browser */ }
+}
+async function releaseWakeLock() {
+  if (wakeLock) { try { await wakeLock.release(); } catch(e){} wakeLock = null; }
+  updateBadges();
+}
+
+// Re-acquire wake lock when tab becomes visible again (it releases on screen-off)
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && sess.running) {
+    await acquireWakeLock();
+    // Recalc elapsed from wall clock in case setInterval was throttled
+    if (sess.sessionStartWall && sess.sessionPhaseStartWall) {
+      const ex = sess.plan?.exercises?.[sess.idx];
+      if (ex && ex.type === 'timer') {
+        sess.elapsed = Math.floor((Date.now() - sess.sessionPhaseStartWall) / 1000);
+        if (sess.elapsed >= ex.duration) {
+          advanceSession();
+          return;
+        }
+        updateRingDisplay();
+      }
+    }
+  }
+});
+
+// ── Silent audio keepalive ──
+// Playing a near-silent tone prevents mobile browsers throttling the tab
+let keepaliveNode = null;
+function startKeepalive() {
+  stopKeepalive();
+  try {
+    const ctx = getAC();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0.00001; // inaudible
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    keepaliveNode = { osc, gain };
+    updateBadges();
+  } catch(e) {}
+}
+function stopKeepalive() {
+  if (keepaliveNode) {
+    try { keepaliveNode.osc.stop(); } catch(e) {}
+    keepaliveNode = null;
+  }
+  updateBadges();
+}
+
 function resumeSession() {
   sess.running = true;
+  sess.sessionPhaseStartWall = Date.now() - (sess.elapsed * 1000); // anchor wall clock
   document.getElementById('rPlayBtn').textContent = 'PAUSE';
-  sess.timer = setInterval(tickSession, 1000);
+  // Wall-clock based interval — fires every 500ms but uses Date.now() diff for accuracy
+  sess.timer = setInterval(tickSession, 500);
+  acquireWakeLock();
+  startKeepalive();
   ringBell(parseInt(document.getElementById('setBellVol').value));
 }
 
 function pauseSession() {
   sess.running = false;
-  document.getElementById('rPlayBtn').textContent = 'RESUME';
   clearInterval(sess.timer);
+  releaseWakeLock();
+  stopKeepalive();
+  document.getElementById('rPlayBtn').textContent = 'RESUME';
 }
 
 function tickSession() {
-  const ex = sess.plan.exercises[sess.idx];
-  if(ex.type==='aum'||ex.type==='surya') { updateRingDisplay(); return; }
-  sess.elapsed++;
+  const ex = sess.plan?.exercises?.[sess.idx];
+  if (!ex) return;
+  if (ex.type === 'aum' || ex.type === 'surya') { updateRingDisplay(); return; }
+
+  // Wall-clock elapsed — immune to setInterval throttling
+  const wallElapsed = Math.floor((Date.now() - sess.sessionPhaseStartWall) / 1000);
+  sess.elapsed = wallElapsed;
+
   updateRingDisplay();
-  if(sess.elapsed >= ex.duration) advanceSession();
+  if (sess.elapsed >= ex.duration) advanceSession();
 }
 
 function updateRingDisplay() {
@@ -1036,6 +1136,8 @@ function sessionPrev() {
 function finishSession() {
   clearInterval(sess.timer); sess.running=false;
   stopCurrentExerciseSideEffects();
+  releaseWakeLock();
+  stopKeepalive();
   document.getElementById('rPlayBtn').textContent = 'DONE';
   document.getElementById('rExName').textContent = 'Session Complete';
   document.getElementById('rExType').textContent = 'NAMASTE 🙏';
@@ -1050,6 +1152,8 @@ function finishSession() {
 function endSession() {
   clearInterval(sess.timer); sess.running=false;
   stopCurrentExerciseSideEffects();
+  releaseWakeLock();
+  stopKeepalive();
   switchView('planner');
 }
 
