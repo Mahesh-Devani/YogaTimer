@@ -176,13 +176,32 @@ label.lbl {
 .ex-list { list-style:none; display:flex; flex-direction:column; gap:8px; margin-bottom:12px; min-height:40px; position:relative; }
 
 
-.drag-handle { color:var(--text-dim); font-size:1rem; cursor:grab; flex-shrink:0; }
-.ex-badge {
-  width:22px; height:22px; border-radius:50%;
-  background:var(--gold-dim); color:var(--gold);
-  font-family:'Cinzel',serif; font-size:.6rem;
-  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+.drag-zone {
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:3px; flex-shrink:0;
+  padding: 8px 6px;        /* large touch target */
+  margin: -8px -4px -8px -8px; /* bleed into card padding so finger doesn't miss */
+  border-radius:10px 0 0 10px;
+  cursor:grab;
+  touch-action:none;
+  user-select:none;
+  transition: background .15s;
+  min-width: 40px;          /* at least 40px wide on mobile */
 }
+.drag-zone:active, .drag-zone.dragging { cursor:grabbing; background:rgba(232,131,42,.08); }
+.drag-handle {
+  color:var(--text-dim); font-size:1.05rem; line-height:1;
+  transition: color .15s;
+}
+.drag-zone:active .drag-handle { color:var(--saffron); }
+.ex-badge {
+  width:20px; height:20px; border-radius:50%;
+  background:var(--gold-dim); color:var(--gold);
+  font-family:'Cinzel',serif; font-size:.58rem;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+  transition: background .15s, color .15s;
+}
+.drag-zone:active .ex-badge { background:rgba(232,131,42,.25); color:var(--saffron); }
 .ex-content { flex:1; display:flex; flex-direction:column; gap:4px; min-width:0; }
 .ex-name-row { display:flex; align-items:center; gap:6px; }
 .ex-name { flex:1; font-size:.9rem; min-width:0; padding:4px 7px; }
@@ -433,7 +452,32 @@ input[type=range]::-moz-range-thumb:active { cursor:grabbing; transform:scale(1.
   margin-bottom:10px; font-style:italic;
 }
 
-/* ── TOAST ── */
+/* ── UNDO BAR ── */
+.undo-bar {
+  position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
+  background:linear-gradient(135deg, #2E1808, #1A0A02);
+  border:1px solid rgba(232,131,42,.4);
+  border-radius:14px; padding:10px 16px;
+  display:flex; align-items:center; gap:12px;
+  z-index:600; opacity:0; pointer-events:none;
+  transition:opacity .3s, transform .3s;
+  transform: translateX(-50%) translateY(10px);
+  white-space:nowrap; box-shadow:0 4px 20px rgba(0,0,0,.5);
+}
+.undo-bar.show {
+  opacity:1; pointer-events:all;
+  transform: translateX(-50%) translateY(0);
+}
+.undo-bar-msg { font-size:.72rem; color:var(--cream); font-style:italic; }
+.undo-bar-btn {
+  padding:5px 12px; border-radius:8px; border:none;
+  background:var(--saffron); color:var(--deep);
+  font-family:'Cinzel',serif; font-size:.62rem; letter-spacing:.08em;
+  font-weight:700; cursor:pointer; transition:all .18s;
+}
+.undo-bar-btn:hover { background:var(--gold); }
+.undo-bar-dismiss { font-size:.75rem; color:var(--text-dim); cursor:pointer; padding:2px 4px; }
+.undo-bar-dismiss:hover { color:var(--cream); }
 .toast {
   position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
   background:linear-gradient(135deg,var(--bark2),var(--deep));
@@ -526,6 +570,11 @@ input[type=range]::-moz-range-thumb:active { cursor:grabbing; transform:scale(1.
 <div class="grain"></div>
 <div class="bell-flash" id="bellFlash"></div>
 <div class="toast" id="toast"></div>
+<div class="undo-bar" id="undoBar">
+  <span class="undo-bar-msg" id="undoMsg">—</span>
+  <button class="undo-bar-btn" onclick="performUndo()">↩ UNDO</button>
+  <span class="undo-bar-dismiss" onclick="dismissUndo()">✕</span>
+</div>
 
 <!-- SURYA GUIDE MODAL -->
 <div class="modal-overlay" id="suryaModal" onclick="closeSuryaGuide(event)">
@@ -717,7 +766,7 @@ function ringBell(vol=80) {
     const o=ctx.createOscillator(), g=ctx.createGain();
     o.connect(g); g.connect(ctx.destination);
     o.frequency.value=f; o.type='sine';
-    const a=v*(i===0?.45:.12/(i+1));
+    const a=v*(i===0 ? .45:.12/(i+1));
     g.gain.setValueAtTime(a,ctx.currentTime);
     g.gain.exponentialRampToValueAtTime(.0001,ctx.currentTime+3.5);
     o.start(ctx.currentTime); o.stop(ctx.currentTime+3.5);
@@ -780,7 +829,39 @@ function savePlans() {
 function getPlan(id) { return plans.find(p=>p.id===id); }
 
 // ══════════════════════════════════════
-// PLAN BUILDER
+// UNDO SYSTEM
+// ══════════════════════════════════════
+let undoStack = []; // [{label, restore}]
+let undoTimer = null;
+
+function pushUndo(label, restoreFn) {
+  undoStack.push({ label, restore: restoreFn });
+  if (undoStack.length > 10) undoStack.shift();
+  showUndoBar(label);
+}
+
+function showUndoBar(msg) {
+  clearTimeout(undoTimer);
+  document.getElementById('undoMsg').textContent = msg;
+  document.getElementById('undoBar').classList.add('show');
+  undoTimer = setTimeout(dismissUndo, 6000);
+}
+
+function dismissUndo() {
+  clearTimeout(undoTimer);
+  document.getElementById('undoBar').classList.remove('show');
+  // Clear stack when bar is dismissed — prevents stale undos
+  undoStack = [];
+}
+
+function performUndo() {
+  const action = undoStack.pop();
+  if (!action) return;
+  // Dismiss bar FIRST so user can't click again mid-restore
+  dismissUndo();
+  action.restore();
+  showToast('↩ Undone');
+}
 // ══════════════════════════════════════
 let exerciseCount = 0;
 
@@ -812,8 +893,10 @@ function addExercise(ex=null) {
   li.className = 'ex-item';
   li.dataset.id = id;
   li.innerHTML = `
-    <span class="drag-handle">⠿</span>
-    <div class="ex-badge">${exerciseCount}</div>
+    <div class="drag-zone">
+      <span class="drag-handle">⠿</span>
+      <div class="ex-badge">${exerciseCount}</div>
+    </div>
     <div class="ex-content">
       <div class="ex-name-row">
         <input class="ex-name" type="text" value="${name}" placeholder="Exercise name" oninput="updatePlanSummary()">
@@ -879,7 +962,7 @@ function addExercise(ex=null) {
 
   initDrag(li);
   updatePlanSummary();
-  updateBadges();
+  updateExBadges();
 }
 
 function onTypeChange(sel, id) {
@@ -894,13 +977,114 @@ function onTypeChange(sel, id) {
   updatePlanSummary();
 }
 
-function removeExercise(id) {
-  document.querySelector(`[data-id="${id}"]`)?.remove();
-  updateBadges();
-  updatePlanSummary();
+// Snapshot one li's data for undo restore
+function getExerciseItemData(li, idx) {
+  const type = li.querySelector('.ex-type-sel')?.value || 'timer';
+  const aumInp = li.querySelector('.ex-aum-target');
+  const aumSensInp = li.querySelector('.ex-aum-sens');
+  const aumMinDurInp = li.querySelector('.ex-aum-mindur');
+  const suryaInp = li.querySelector('.ex-surya-target');
+  const suryaSensInp = li.querySelector('.ex-surya-sens');
+  return {
+    name: li.querySelector('.ex-name')?.value?.trim() || ('Exercise '+(idx+1)),
+    type,
+    duration: parseInt(li.querySelector('.ex-dur')?.value) || 300,
+    aumTarget: aumInp ? parseInt(aumInp.value)||21 : 21,
+    aumSens: aumSensInp ? parseInt(aumSensInp.value)||5 : 5,
+    aumMinDur: aumMinDurInp ? parseInt(aumMinDurInp.value)||600 : 600,
+    suryaTarget: suryaInp ? parseInt(suryaInp.value)||3 : 3,
+    suryaSens: suryaSensInp ? parseInt(suryaSensInp.value)||5 : 5,
+  };
 }
 
-function updateBadges() {
+// Build a new li from saved data (used by undo restore)
+function buildExerciseLi(ex) {
+  exerciseCount++;
+  const id = 'ex_' + Date.now() + '_' + exerciseCount;
+  const isAum = ex.type==='aum', isSurya = ex.type==='surya';
+  const li = document.createElement('li');
+  li.className = 'ex-item'; li.dataset.id = id;
+  li.innerHTML = `
+    <div class="drag-zone">
+      <span class="drag-handle">⠿</span>
+      <div class="ex-badge">${exerciseCount}</div>
+    </div>
+    <div class="ex-content">
+      <div class="ex-name-row">
+        <input class="ex-name" type="text" value="${ex.name}" placeholder="Exercise name" oninput="updatePlanSummary()">
+        <button class="btn-icon" onclick="removeExercise('${id}')" title="Remove">✕</button>
+      </div>
+      <div class="ex-meta">
+        <select class="ex-type-sel" onchange="onTypeChange(this,'${id}')">
+          <option value="timer" ${ex.type==='timer'?'selected':''}>⏱ Timer</option>
+          <option value="aum"   ${ex.type==='aum'?'selected':''}>🔔 AUM</option>
+          <option value="surya" ${ex.type==='surya'?'selected':''}>🌅 Surya</option>
+        </select>
+        <input class="ex-dur" type="number" value="${ex.duration}" min="5" max="7200"
+          oninput="updatePlanSummary()" style="${isAum||isSurya?'opacity:.45;':''}">
+        <span class="ex-dur-unit" id="durUnit_${id}">${isAum?'(auto)':isSurya?'(auto)':'sec'}</span>
+      </div>
+      <div class="ex-extra" id="extraAum_${id}" style="display:${isAum?'flex':'none'};flex-wrap:wrap;gap:6px;">
+        <div style="display:flex;align-items:center;gap:4px;">
+          <label>Target:</label>
+          <input type="number" class="ex-aum-target" value="${ex.aumTarget}" min="1" max="1000">
+          <label>chants</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:4px;width:100%;">
+          <label>Sens:</label>
+          <input type="range" class="ex-aum-sens" min="1" max="10" value="${ex.aumSens}">
+          <span class="sens-lbl" id="aumSensLbl_${id}">${ex.aumSens}</span>
+          <label style="margin-left:6px;">MinDur:</label>
+          <input type="number" class="ex-aum-mindur" value="${ex.aumMinDur}" min="300" max="4000" style="width:56px;">
+          <label>ms</label>
+        </div>
+        <div style="font-size:.58rem;color:var(--text-dim);font-style:italic;line-height:1.4;">Sens 1–3 = quiet room · 4–6 = normal · 7–10 = loud only</div>
+      </div>
+      <div class="ex-extra" id="extraSurya_${id}" style="display:${isSurya?'flex':'none'};flex-wrap:wrap;gap:6px;">
+        <div style="display:flex;align-items:center;gap:4px;width:100%;">
+          <label>Target:</label>
+          <input type="number" class="ex-surya-target" value="${ex.suryaTarget}" min="1" max="108">
+          <label>rounds</label>
+          <label style="margin-left:6px;">Sens:</label>
+          <input type="range" class="ex-surya-sens" min="1" max="10" value="${ex.suryaSens}">
+          <span class="sens-lbl" id="sensLbl_${id}">${ex.suryaSens}</span>
+          <button class="btn-icon" style="background:rgba(123,167,188,.12);color:var(--sky);font-size:.7rem;width:24px;height:24px;margin-left:2px;" onclick="openSuryaGuide()">📖</button>
+        </div>
+        <div style="font-size:.58rem;color:var(--text-dim);font-style:italic;line-height:1.4;">Sens 1–3 = any movement · 4–6 = pose match · 7–10 = exact sequence</div>
+      </div>
+    </div>`;
+  document.getElementById('exList').appendChild(li);
+  const suryaSensEl = li.querySelector('.ex-surya-sens');
+  const aumSensEl = li.querySelector('.ex-aum-sens');
+  suryaSensEl?.addEventListener('input', function() { document.getElementById('sensLbl_'+id).textContent = this.value; });
+  aumSensEl?.addEventListener('input', function() { document.getElementById('aumSensLbl_'+id).textContent = this.value; });
+  if (suryaSensEl) initRangeTrack(suryaSensEl, 'var(--sky)');
+  if (aumSensEl)   initRangeTrack(aumSensEl, 'var(--gold)');
+  initDrag(li);
+  return li;
+}
+
+function removeExercise(id) {
+  const li = document.querySelector(`[data-id="${id}"]`);
+  if (!li) return;
+  const list = document.getElementById('exList');
+  const idx = [...list.children].indexOf(li);
+  // Snapshot the exercise data for restore
+  const snapshot = getExerciseItemData(li, idx);
+  li.remove();
+  updateExBadges();
+  updatePlanSummary();
+  pushUndo(`Deleted "${snapshot.name}"`, () => {
+    exerciseCount++;
+    const restored = buildExerciseLi(snapshot);
+    const items = [...list.children];
+    if (idx < items.length) list.insertBefore(restored, items[idx]);
+    else list.appendChild(restored);
+    updateExBadges(); updatePlanSummary();
+  });
+}
+
+function updateExBadges() {
   document.querySelectorAll('.ex-item').forEach((li,i) => {
     li.querySelector('.ex-badge').textContent = i+1;
   });
@@ -967,11 +1151,21 @@ function loadPlan(id) {
 
 function deleteCurrentPlan() {
   if(!currentPlanId) return;
+  const plan = getPlan(currentPlanId);
+  if (!plan) return;
+  const snapshot = JSON.parse(JSON.stringify(plan));
   plans = plans.filter(p=>p.id!==currentPlanId);
   savePlans();
+  const deletedId = currentPlanId;
   currentPlanId = null;
   newPlan();
-  showToast('Plan deleted');
+  pushUndo(`Deleted plan "${snapshot.name}"`, () => {
+    plans = plans.filter(p => p.id !== snapshot.id); // dedup before restore
+    plans.push(snapshot);
+    savePlans();
+    currentPlanId = snapshot.id;
+    loadPlan(snapshot.id);
+  });
 }
 
 function clearAllData() {
@@ -990,17 +1184,42 @@ function renderSavedPlans() {
   plans.forEach(p => {
     const pill = document.createElement('div');
     pill.className = 'plan-pill' + (p.id===currentPlanId?' active-plan':'');
-    pill.innerHTML = `<span onclick="loadPlan('${p.id}')">${p.name}</span>
-      <span class="del-pill" onclick="deletePlanById('${p.id}')">✕</span>`;
+    pill.style.cursor = 'pointer';
+    // Whole pill loads plan, except the ✕ button
+    pill.addEventListener('click', (e) => {
+      if (e.target.classList.contains('del-pill')) return;
+      loadPlan(p.id);
+    });
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = p.name;
+    const delSpan = document.createElement('span');
+    delSpan.className = 'del-pill';
+    delSpan.textContent = '✕';
+    delSpan.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deletePlanById(p.id);
+    });
+    pill.appendChild(nameSpan);
+    pill.appendChild(delSpan);
     container.appendChild(pill);
   });
 }
 
 function deletePlanById(id) {
+  const plan = getPlan(id);
+  if (!plan) return;
+  const snapshot = JSON.parse(JSON.stringify(plan));
   plans = plans.filter(p=>p.id!==id);
   savePlans();
   if(currentPlanId===id) { currentPlanId=null; newPlan(); }
   renderSavedPlans();
+  pushUndo(`Deleted plan "${snapshot.name}"`, () => {
+    plans = plans.filter(p => p.id !== snapshot.id); // dedup before restore
+    plans.push(snapshot);
+    savePlans();
+    currentPlanId = snapshot.id;
+    loadPlan(snapshot.id);
+  });
 }
 
 // ── DRAG & DROP — reliable pointer-event implementation ──
@@ -1078,7 +1297,7 @@ function _onDragEnd(e) {
     if (target && target !== drag.src) {
       if (drag.overPos === 'above') list.insertBefore(drag.src, target);
       else target.after(drag.src);
-      updateBadges();
+      updateExBadges();
       updatePlanSummary();
     }
   }
@@ -1102,33 +1321,31 @@ document.addEventListener('touchend',    _onDragEnd);
 document.addEventListener('pointercancel', _onDragEnd);
 
 function initDrag(li) {
-  const handle = li.querySelector('.drag-handle');
-  if (!handle) return;
-  handle.style.cursor     = 'grab';
-  handle.style.touchAction = 'none';
+  const zone = li.querySelector('.drag-zone');
+  if (!zone) return;
+  zone.style.touchAction = 'none';
 
-  handle.addEventListener('pointerdown', (e) => {
+  zone.addEventListener('pointerdown', (e) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     e.preventDefault();
     e.stopPropagation();
 
     const rect = li.getBoundingClientRect();
     drag.src     = li;
-    drag.offsetX = (e.clientX ?? e.touches?.[0]?.clientX ?? 0) - rect.left;
-    drag.offsetY = (e.clientY ?? e.touches?.[0]?.clientY ?? 0) - rect.top;
+    drag.offsetX = (e.clientX ?? 0) - rect.left;
+    drag.offsetY = (e.clientY ?? 0) - rect.top;
     drag.overIdx = -1;
     drag.overPos = null;
     drag.active  = true;
 
     li.classList.add('drag-source');
     drag.ghost = createGhost(li);
-    // Position ghost immediately so it doesn't flash at 0,0
     drag.ghost.style.left = (e.clientX - drag.offsetX) + 'px';
     drag.ghost.style.top  = (e.clientY - drag.offsetY) + 'px';
     requestAnimationFrame(() => drag.ghost?.classList.add('visible'));
 
-    // Capture pointer so move events keep firing even if pointer leaves handle
-    handle.setPointerCapture(e.pointerId);
+    // Capture keeps move/up firing even when pointer leaves the zone
+    zone.setPointerCapture(e.pointerId);
   });
 }
 
